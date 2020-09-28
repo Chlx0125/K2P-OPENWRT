@@ -6,7 +6,7 @@ on:
     branches:
       - master
     paths:
-      - '.config.openwrt'
+      - 'k2p.config'
       - '.github/workflows/k2p-build.yml'
 
     
