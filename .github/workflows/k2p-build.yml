@@ -1,75 +1,159 @@
-name: OpenWrt k2p
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
+
+name: Build OpenWrt
+
 on:
-#  schedule:
-#    - cron:  0 7 * * 5
+  repository_dispatch:
+  release:
+    types: published
   push:
     branches:
-      - master
+      - main
     paths:
       - 'k2p.config'
-      - '.github/workflows/k2p-build.yml'
+#  schedule:
+#    - cron: 0 8 * * 5
+#  watch:
+#    types: started
 
-    
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: k2p.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  SSH_ACTIONS: true
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: false
+  UPLOAD_COWTRANSFER: true
+  UPLOAD_WETRANSFER: false
+  TZ: Asia/Shanghai
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    if: github.event.repository.owner.id == github.event.sender.id
+
     steps:
+    - name: Checkout
+      uses: actions/checkout@main
 
-    - name: Checkout - clone repository
-      uses: actions/checkout@v2
-
-    - name: Install - system build dependencies
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo swapoff /swapfile || echo "no swapfile"
-        sudo rm -rf /swapfile /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc || echo "clean partly"
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        sudo -E apt-get -yqq install subversion build-essential libncurses5-dev zlib1g-dev gawk git ccache gettext libssl-dev xsltproc zip
-        sudo -E apt-get -yqq autoremove --purge
+        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-latest)
+        sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
 
-    - name: Download - openwrt source download
+    - name: Clone source code
+      working-directory: /workdir
       run: |
-        git clone -b openwrt-19.07 https://github.com/openwrt/openwrt.git
-        
-    - name: Update - openwrt source update and install 
+        df -hT $PWD
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
       run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
         cd openwrt
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        $GITHUB_WORKSPACE/$DIY_P1_SH
 
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+    
     - name: Clone - openwrt plugin source
       run: |
         cd openwrt
         git clone https://github.com/MeIsReallyBa/k2p-openwrt-mt7615_5.0.2.0 package/mtk
-    
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
     - name: SSH connection to Actions
       uses: P3TERX/debugger-action@main
       if: env.SSH_ACTIONS == 'true' || contains(github.event.action, 'ssh')
 
-    - name: Config - official openwrt k2p build config
+    - name: Download package
+      id: package
       run: |
-        cp k2p.config openwrt/.config
         cd openwrt
         make defconfig
-
-    - name: Download - openwrt build dependencies
-      run: |
-        cd openwrt
         make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-    - name: Build - make openwrt source
+    - name: Compile the firmware
+      id: compile
       run: |
         cd openwrt
-        make -j$(nproc)
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "::set-output name=status::success"
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "::set-env name=DEVICE_NAME::_$(cat DEVICE_NAME)"
+        echo "::set-env name=FILE_DATE::_$(date +"%Y%m%d%H%M")"
 
-    - name: Remove - delete packages files
-      run: |
-        cd openwrt/bin/targets/ramips/mt7621/
-        rm -rf packages/
-        ls -hl
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
 
-    - name: Upload - push to artifact file
-      uses: actions/upload-artifact@v1
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
-        name: openwrt-k2p
-        path: openwrt/bin/targets/ramips/mt7621/
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "::set-env name=FIRMWARE::$PWD"
+        echo "::set-output name=status::success"
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Upload firmware to cowtransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
+        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
+
+    - name: Upload firmware to WeTransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
+        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
